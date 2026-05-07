@@ -1,0 +1,710 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{microtype}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  citecolor=green!50!black,
+  urlcolor=blue!70!black,
+}
+
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\title{\textbf{Constrained Path Planning in a Dynamic 2-D Cost Landscape}\\[0.4em]
+\large Mathematical Problem Formulation and Proposed Solution}
+\author{Path-Solver --- Technical Reference}
+\date{}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\bigskip
+
+% ============================================================
+\section{Overview}
+% ============================================================
+
+This document describes a constrained kinodynamic path-planning problem in a
+2-D environment whose traversal cost evolves stochastically over time.
+The planner must find a set of diverse, ranked candidate trajectories from a
+fixed start pose to a goal region, respecting vehicle kinematic limits,
+obstacle clearance requirements, and a monotone forward-progress condition.
+When new environmental observations arrive (``trigger events''), the planner
+reruns from scratch on the updated cost field and presents a refreshed ranked
+list to the operator.
+
+The code base consists of six Python modules:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Module & Responsibility \\
+\midrule
+\texttt{cost\_landscape.py} & RBF cost field with OU-process dynamics \\
+\texttt{vehicle\_model.py}  & Vehicle geometry and kinematic limits \\
+\texttt{event\_emulator.py} & Poisson-clock trigger system \\
+\texttt{graph\_search.py}   & Diverse A* seed generation \\
+\texttt{optimizer.py}       & Constrained NLP path optimizer \\
+\texttt{main.py}            & Orchestrator and visualizer \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% ============================================================
+\section{Environment Model --- Dynamic Cost Landscape}
+% ============================================================
+
+\subsection{Scalar Cost Field}
+
+The environment is a bounded 2-D domain
+$\mathcal{D} = [x_{\min}, x_{\max}] \times [y_{\min}, y_{\max}] = [0, 100]^2\,\mathrm{m}$.
+A scalar cost field $C : \mathcal{D} \to \mathbb{R}_{>0}$ is defined as a
+superposition of anisotropic Gaussian (Radial Basis Function, RBF) sources plus
+a constant background term:
+
+\begin{equation}
+  \label{eq:cost_field}
+  C(\mathbf{p}) = c_{\mathrm{bg}} + \sum_{s \in \mathcal{S} \cup \mathcal{O}}
+    A_s \exp\!\left(
+      -\frac{1}{2}\left[
+        \left(\frac{u_s(\mathbf{p})}{\sigma_x^s}\right)^{\!2}
+        + \left(\frac{v_s(\mathbf{p})}{\sigma_y^s}\right)^{\!2}
+      \right]
+    \right),
+\end{equation}
+
+where $\mathbf{p} = (x, y)^\top$, $c_{\mathrm{bg}} = 0.1$,
+$\mathcal{S}$ is the set of regular (soft) sources, and $\mathcal{O}$ is the
+set of hard obstacle sources.
+
+For source $s$ with centre $\mathbf{c}_s = (c_x^s, c_y^s)^\top$ and
+orientation angle $\vartheta_s$, the local rotated coordinates are
+
+\begin{align}
+  u_s(\mathbf{p}) &= \phantom{-}\cos(\vartheta_s)\,(x - c_x^s) + \sin(\vartheta_s)\,(y - c_y^s), \\
+  v_s(\mathbf{p}) &= -\sin(\vartheta_s)\,(x - c_x^s) + \cos(\vartheta_s)\,(y - c_y^s).
+\end{align}
+
+\subsubsection*{Source parameters}
+
+Each source $s \in \mathcal{S}$ is characterised by the parameter tuple
+$(c_x^s, c_y^s, \sigma_x^s, \sigma_y^s, A_s, \vartheta_s)$ together with an
+integer \emph{age} counter $k_s \ge 0$.
+Initial values are drawn uniformly:
+$A_s \sim \mathcal{U}(0.5, 5.0)$,
+$\sigma_{\mathrm{base}} \sim \mathcal{U}(3, 15)$\,m; with probability $0.3$
+the source is \emph{elongated} ($\sigma_y^s = \sigma_{\mathrm{base}} \cdot
+\mathcal{U}(0.2, 0.5)$) and otherwise roughly isotropic
+($\sigma_y^s = \sigma_{\mathrm{base}} \cdot \mathcal{U}(0.7, 1.3)$).
+
+\subsubsection*{Obstacle sources}
+
+Hard obstacles are placed in the interior $[15, 85]^2$\,m with fixed parameters
+$A_{\mathrm{obs}} = 10^4$ and $\sigma_x = \sigma_y = 3$\,m, yielding a cost
+that vastly exceeds any traversal budget wherever the vehicle footprint
+overlaps the obstacle centre.
+There are $N_{\mathrm{obs}} = 4$ obstacles at initialisation.
+
+\subsection{Ornstein--Uhlenbeck Dynamics}
+
+At each discrete time step $t$, the cost field evolves through an
+Ornstein--Uhlenbeck (OU) update applied independently to the parameters of
+every regular source $s \in \mathcal{S}$.
+
+\subsubsection*{Amplitude}
+
+\begin{equation}
+  \label{eq:ou_amplitude}
+  A_s \;\leftarrow\; A_s
+    + \underbrace{\theta_A \,\bigl(\bar{A} - A_s\bigr)}_{\text{mean reversion}}
+    + \underbrace{\sigma_A \,\xi_A}_{\text{volatility}},
+  \qquad
+  \xi_A \sim \mathcal{N}(0,1),
+\end{equation}
+
+with mean-reversion rate $\theta_A = 0.3$, volatility $\sigma_A = 0.4$, and
+long-run mean $\bar{A} = (A_{\min} + A_{\max})/2 = 2.75$.
+The result is clamped to $[0.1, \infty)$.
+
+\subsubsection*{Position}
+
+\begin{align}
+  c_x^s &\leftarrow c_x^s
+    + 0.01\,\theta_P\,\bigl(\bar{x} - c_x^s\bigr)
+    + \sigma_P\,\xi_x, \\
+  c_y^s &\leftarrow c_y^s
+    + 0.01\,\theta_P\,\bigl(\bar{y} - c_y^s\bigr)
+    + \sigma_P\,\xi_y,
+\end{align}
+
+with $\theta_P = 0.1$, $\sigma_P = 1.5$\,m, domain-centre means
+$\bar{x} = \bar{y} = 50$\,m, and $\xi_x, \xi_y \sim \mathcal{N}(0,1)$.
+Positions are clamped to $\mathcal{D}$.
+The small coefficient $0.01$ makes the mean reversion of position very weak,
+so sources perform nearly free Brownian drift.
+
+\subsubsection*{Width}
+
+\begin{equation}
+  \sigma_x^s \leftarrow \operatorname{clip}\!\bigl(
+    \sigma_x^s + \sigma_W\,\xi_{\sigma x},\;1,\;25\bigr),
+  \qquad
+  \sigma_y^s \leftarrow \operatorname{clip}\!\bigl(
+    \sigma_y^s + \sigma_W\,\xi_{\sigma y},\;1,\;25\bigr),
+\end{equation}
+
+with width volatility $\sigma_W = 0.3$\,m.
+
+\subsubsection*{Orientation}
+
+\begin{equation}
+  \vartheta_s \leftarrow \vartheta_s + 0.05\,\xi_\theta, \qquad
+  \xi_\theta \sim \mathcal{N}(0,1).
+\end{equation}
+
+\subsubsection*{Obstacle drift}
+
+Hard obstacle centres perform unconstrained Brownian drift without any OU
+mean reversion or death:
+
+\begin{equation}
+  c_{x/y}^{\mathrm{obs}} \leftarrow c_{x/y}^{\mathrm{obs}}
+    + 0.3\,\xi, \quad \xi \sim \mathcal{N}(0,1),
+\end{equation}
+
+clamped to $[5, 95]$\,m in each axis.
+
+\subsection{Birth--Death Process}
+
+At each update step, after the OU evolution, the source population undergoes:
+
+\textbf{Death.}  Source $s$ is removed with probability
+\begin{equation}
+  p_{\mathrm{death}}(s) = \lambda_D \,\bigl(1 + 0.1\,k_s\bigr),
+\end{equation}
+where $\lambda_D = 0.15$ is the base death rate and $k_s$ is the source age.
+Death is suppressed if the surviving count would fall below
+$N_{\min} = 8$.
+
+\textbf{Birth.}  A Poisson-distributed number of new sources is created:
+\begin{equation}
+  N_{\mathrm{new}} \sim \operatorname{Poisson}(\lambda_B),
+  \quad \lambda_B = 0.3,
+\end{equation}
+capped so the total count remains $\le N_{\max} = 25$.
+New-born sources are initialised with $A_s$ scaled by $0.3$ (attenuated at
+birth) and $k_s = 0$.
+
+% ============================================================
+\section{Vehicle Model}
+% ============================================================
+
+\subsection{Geometry}
+
+The vehicle is modelled as a rectangular rigid body with physical dimensions
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Parameter & Symbol & Value \\
+\midrule
+Body length & $L$ & $5.0$\,m \\
+Body width  & $W$ & $2.5$\,m \\
+Half-length & $\ell = L/2$ & $2.5$\,m \\
+Half-width  & $w = W/2$   & $1.25$\,m \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Kinematic Limits}
+
+The vehicle obeys the following bounds, used as hard constraints in the
+optimizer:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Constraint & Symbol & Value \\
+\midrule
+Maximum speed          & $v_{\max}$         & $15.0$\,m/s \\
+Minimum speed          & $v_{\min}$         & $0.5$\,m/s \\
+Maximum long.\ accel.  & $a_{\max}$         & $3.0$\,m/s$^2$ \\
+Maximum lat.\ accel.   & $a_{\mathrm{lat}}$ & $2.0$\,m/s$^2$ \\
+Maximum curvature      & $\kappa_{\max}$    & $0.15$\,m$^{-1}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Oriented Bounding Box Footprint}
+
+For obstacle-clearance evaluation the vehicle footprint at pose
+$(x, y, \theta)$ is approximated by five sample points: the centre and the
+four corners of the oriented bounding box (OBB).
+In the vehicle's local frame the five unit template points are
+
+\begin{equation}
+  \mathcal{F}_{\mathrm{unit}} =
+  \{(0,0),\;(1,1),\;(1,-1),\;(-1,1),\;(-1,-1)\},
+\end{equation}
+
+scaled to world extents as $(\ell \cdot \hat{u},\; w \cdot \hat{v})$ and then
+rotated and translated to world coordinates:
+
+\begin{equation}
+  \mathbf{p}_k = \mathbf{R}(\theta)\,
+    \begin{pmatrix} \ell\,\hat{u}_k \\ w\,\hat{v}_k \end{pmatrix}
+  + \begin{pmatrix} x \\ y \end{pmatrix},
+  \quad
+  \mathbf{R}(\theta) = \begin{pmatrix}
+    \cos\theta & -\sin\theta \\ \sin\theta & \cos\theta
+  \end{pmatrix}.
+\end{equation}
+
+The \emph{mean footprint cost} $\bar{C}_{\mathrm{fp}}$ and
+\emph{max footprint cost} $\hat{C}_{\mathrm{fp}}$ are
+
+\begin{equation}
+  \bar{C}_{\mathrm{fp}}(x,y,\theta) = \frac{1}{5}\sum_{k=1}^{5} C(\mathbf{p}_k),
+  \qquad
+  \hat{C}_{\mathrm{fp}}(x,y,\theta) = \max_{k} C(\mathbf{p}_k).
+\end{equation}
+
+% ============================================================
+\section{Trigger Event Model}
+% ============================================================
+
+A Poisson-process clock generates discrete ``trigger events'' that cause the
+planner to rerun.
+Inter-arrival times are drawn from an exponential distribution:
+
+\begin{equation}
+  \Delta t_k \sim \operatorname{Exp}\!\left(\frac{1}{\mu_T}\right),
+  \quad \mu_T = 8.0\,\mathrm{s}.
+\end{equation}
+
+Between two consecutive events, the cost landscape is updated once via the
+OU step described in Section~2.2--2.3.
+Each event records a cost-delta norm
+
+\begin{equation}
+  \|\Delta C\|_2 = \left\|
+    C^{(t+1)}\big|_{\mathrm{grid}} - C^{(t)}\big|_{\mathrm{grid}}
+  \right\|_2,
+\end{equation}
+
+evaluated on a $50 \times 50$ uniform sample grid with values clipped to
+$[0, 50]$ before differencing.
+
+% ============================================================
+\section{Path Planning Problem}
+% ============================================================
+
+\subsection{State Representation}
+
+A path is represented as a discrete sequence of $N$ \emph{waypoints}
+(default $N = 20$):
+
+\begin{equation}
+  \pi = \bigl\{(x_i, y_i, \theta_i, v_i)\bigr\}_{i=0}^{N-1},
+\end{equation}
+
+where $(x_i, y_i) \in \mathcal{D}$ is the position, $\theta_i \in [-\pi,\pi]$
+is the heading, and $v_i > 0$ is the speed at waypoint $i$.
+
+\subsection{Decision Variables}
+
+The optimizer operates on a flat real vector of length $4N$:
+
+\begin{equation}
+  \mathbf{z} = \bigl[
+    x_0,\, y_0,\, \theta_0,\, v_0,\;\;
+    x_1,\, y_1,\, \theta_1,\, v_1,\;\;
+    \ldots,\;\;
+    x_{N-1},\, y_{N-1},\, \theta_{N-1},\, v_{N-1}
+  \bigr]^\top \in \mathbb{R}^{4N}.
+\end{equation}
+
+\subsection{Objective Function}
+
+The objective $J(\mathbf{z})$ has four additive terms:
+
+\begin{equation}
+  \label{eq:objective}
+  J(\mathbf{z}) =
+    \underbrace{
+      \sum_{i=0}^{N-2} \bar{C}_{\mathrm{fp}}(x_i, y_i, \theta_i)\,\Delta s_i
+    }_{J_{\mathrm{cost}}}
+    + w_H \underbrace{\sum_{i=0}^{N-2} e_{H,i}^2}_{J_{\mathrm{heading}}}
+    + w_S \underbrace{\sum_{i=0}^{N-2} \Delta\theta_i^2}_{J_{\mathrm{smooth}}}
+    + w_V \underbrace{\sum_{i=0}^{N-2} \Delta v_i^2}_{J_{\mathrm{speed}}},
+\end{equation}
+
+where
+
+\begin{align}
+  \Delta s_i &= \|(x_{i+1} - x_i,\; y_{i+1} - y_i)\|_2, \\[4pt]
+  e_{H,i}    &= \operatorname{wrap}_\pi\!\bigl(
+                  \theta_i - \operatorname{atan2}(y_{i+1}-y_i,\, x_{i+1}-x_i)
+                \bigr), \\[4pt]
+  \Delta\theta_i &= \operatorname{wrap}_\pi(\theta_{i+1} - \theta_i), \\[4pt]
+  \Delta v_i &= v_{i+1} - v_i,
+\end{align}
+
+and the regularisation weights are $w_H = 10$, $w_S = 2$, $w_V = 0.5$.
+The operator $\operatorname{wrap}_\pi(\phi) = (\phi + \pi \bmod 2\pi) - \pi$
+maps any angle to $(-\pi, \pi]$.
+
+Term $J_{\mathrm{cost}}$ measures the arc-length-weighted integrated footprint
+cost along the path.
+$J_{\mathrm{heading}}$ penalises misalignment between the declared heading
+$\theta_i$ and the chord direction, coupling the orientation variable to the
+spatial trajectory.
+$J_{\mathrm{smooth}}$ penalises heading discontinuities.
+$J_{\mathrm{speed}}$ penalises abrupt speed changes.
+
+\subsection{Constraints}
+
+\subsubsection*{Equality: Initial state}
+
+The first waypoint is pinned to the vehicle's current state:
+
+\begin{equation}
+  x_0 = x_{\mathrm{init}}, \quad
+  y_0 = y_{\mathrm{init}}, \quad
+  \operatorname{wrap}_\pi(\theta_0 - \theta_{\mathrm{init}}) = 0, \quad
+  v_0 = v_{\mathrm{init}}.
+\end{equation}
+
+\subsubsection*{Inequality: Goal disk}
+
+The terminal waypoint must lie within a disk of radius $r_G = 5$\,m around the
+goal $\mathbf{p}_G = (90, 90)$\,m:
+
+\begin{equation}
+  (x_{N-1} - x_G)^2 + (y_{N-1} - y_G)^2 \le r_G^2.
+\end{equation}
+
+\subsubsection*{Inequality: Monotone forward progress}
+
+Each successive waypoint must reduce the Euclidean distance to the goal by at
+most a slack $\varepsilon$:
+
+\begin{equation}
+  \label{eq:progress}
+  d_i - d_{i+1} \ge -\varepsilon, \quad i = 0, \ldots, N-2,
+\end{equation}
+
+where $d_i = \|(x_i - x_G, y_i - y_G)\|_2$ and
+
+\begin{equation}
+  \varepsilon = \frac{0.1 \cdot \|(x_G - x_{\mathrm{init}},\;
+                                   y_G - y_{\mathrm{init}})\|_2}{N}
+              \approx \frac{0.1 \cdot 113.1}{20} \approx 0.566\,\mathrm{m}
+\end{equation}
+
+(unless overridden).  This constraint prevents path loops and back-tracking
+while tolerating small lateral excursions.
+
+\subsubsection*{Inequality: Speed bounds}
+
+\begin{equation}
+  v_{\min} \le v_i \le v_{\max}, \quad i = 0, \ldots, N-1.
+\end{equation}
+
+\subsubsection*{Inequality: Longitudinal acceleration}
+
+Using the arc-length-parameterised approximation
+$a_{\mathrm{long},i} \approx \bar{v}_i \cdot \Delta v_i / \Delta s_i$
+with $\bar{v}_i = \tfrac{1}{2}(v_i + v_{i+1})$:
+
+\begin{equation}
+  \left| \bar{v}_i \cdot \frac{\Delta v_i}{\Delta s_i} \right| \le a_{\max},
+  \quad i = 0, \ldots, N-2.
+\end{equation}
+
+\subsubsection*{Inequality: Path curvature}
+
+Discrete curvature is approximated as $\kappa_i \approx |\Delta\theta_i / \Delta s_i|$:
+
+\begin{equation}
+  \kappa_i = \frac{|\operatorname{wrap}_\pi(\theta_{i+1} - \theta_i)|}{\Delta s_i}
+  \le \kappa_{\max},
+  \quad i = 0, \ldots, N-2.
+\end{equation}
+
+\subsubsection*{Inequality: Lateral acceleration}
+
+\begin{equation}
+  a_{\mathrm{lat},i} = \bar{v}_i^2 \,\kappa_i \le a_{\mathrm{lat,max}},
+  \quad i = 0, \ldots, N-2.
+\end{equation}
+
+\subsubsection*{Inequality: Obstacle clearance}
+
+The maximum footprint cost at every waypoint must stay below a hard threshold
+$\tau = 100$:
+
+\begin{equation}
+  \hat{C}_{\mathrm{fp}}(x_i, y_i, \theta_i) \le \tau,
+  \quad i = 0, \ldots, N-1.
+\end{equation}
+
+\subsubsection*{Inequality: Domain boundary}
+
+All waypoints must keep the vehicle OBB inside $\mathcal{D}$ by a margin
+$m = \max(\ell, w)$:
+
+\begin{equation}
+  x_{\min} + m \le x_i \le x_{\max} - m, \quad
+  y_{\min} + m \le y_i \le y_{\max} - m,
+  \quad i = 0, \ldots, N-1.
+\end{equation}
+
+\subsubsection*{Summary}
+
+The complete problem is a nonlinear program (NLP):
+
+\begin{equation}
+  \label{eq:nlp}
+  \min_{\mathbf{z} \in \mathbb{R}^{4N}} J(\mathbf{z})
+  \quad \text{subject to} \quad
+  \mathbf{h}(\mathbf{z}) = \mathbf{0},\quad
+  \mathbf{g}(\mathbf{z}) \ge \mathbf{0},
+\end{equation}
+
+where $\mathbf{h}$ collects the four initial-state equalities and $\mathbf{g}$
+collects the $N-1$ progress constraints, $N-1$ speed-upper, $N$ speed-lower,
+$2(N-1)$ acceleration, $N-1$ curvature, $N-1$ lateral-acceleration, $N$
+obstacle-clearance, and $4N$ domain-boundary inequalities.
+
+% ============================================================
+\section{Solution Method}
+% ============================================================
+
+\subsection{Diverse Seed Generation via Penalty-Augmented A*}
+
+Before invoking the NLP solver a set of $K = 3$ topologically diverse seed
+paths is constructed to initialise different local searches.
+Algorithm~\ref{alg:seeds} describes the procedure.
+
+\begin{algorithm}[H]
+\caption{Diverse seed paths via penalty-augmented A*}
+\label{alg:seeds}
+\begin{algorithmic}[1]
+\Require Cost landscape $C$, start $\mathbf{p}_s$, goal $\mathbf{p}_g$,
+         $K$, grid resolution $R = 80$
+\State Rasterise $C$ to $R \times R$ grid $G_{\mathrm{base}}$
+\State $G_{\mathrm{pen}} \leftarrow \mathbf{0}_{R \times R}$; \quad seeds $\leftarrow []$
+\For{$k = 1, \ldots, K$}
+  \State $G_{\mathrm{cur}} \leftarrow G_{\mathrm{base}} + G_{\mathrm{pen}}$
+  \State Run 8-connected A* on $G_{\mathrm{cur}}$; edge cost $= \delta_{\mathrm{world}} \cdot \bar{G}$
+  \If{path $\pi_k$ found}
+    \State Append $\pi_k$ to seeds
+    \For{each point $\mathbf{q} \in \pi_k$}
+      \State $G_{\mathrm{pen}} \mathrel{+}=
+               A_{\mathrm{pen}} \exp\!\bigl(-\|\mathbf{p}_{\mathrm{grid}} - \mathbf{q}\|^2 /
+               (2\sigma_{\mathrm{pen}}^2)\bigr)$
+    \EndFor
+  \EndIf
+\EndFor
+\State \Return seeds
+\end{algorithmic}
+\end{algorithm}
+
+The A* edge cost between adjacent cells $(r,c)$ and $(r',c')$ is
+
+\begin{equation}
+  w(e) = \delta_{\mathrm{world}} \cdot
+         \max\!\left(\frac{G_{\mathrm{cur}}(r,c) + G_{\mathrm{cur}}(r',c')}{2},\; 0.01\right),
+\end{equation}
+
+where $\delta_{\mathrm{world}}$ is the Euclidean world-frame distance between
+the two cell centres ($1$ or $\sqrt{2}$ grid steps for cardinal or diagonal
+moves, respectively).
+Cells with cost $> 1\% \cdot A_{\mathrm{obs}}$ are treated as impassable.
+
+The Gaussian repulsion penalty uses amplitude $A_{\mathrm{pen}} = 5.0$ and
+width $\sigma_{\mathrm{pen}} = 8.0$\,m, pushing subsequent searches into
+corridors that are spatially separated from already-found paths.
+
+\subsection{Arc-Length Resampling}
+
+Each raw A* path (with variable number of grid-cell waypoints) is resampled to
+exactly $N$ uniformly spaced points in arc-length:
+
+\begin{equation}
+  s_i^* = \frac{i}{N-1} \cdot L_{\mathrm{path}}, \quad i = 0, \ldots, N-1,
+\end{equation}
+
+where $L_{\mathrm{path}} = \sum_j \|\mathbf{p}_{j+1} - \mathbf{p}_j\|_2$ is
+the total path length.
+Linear interpolation between consecutive original points yields
+$\tilde{\mathbf{p}}_i$ at target parameter $s_i^*$.
+
+\subsection{NLP Initialisation}
+
+From a resampled seed $\{\tilde{x}_i, \tilde{y}_i\}$ the initial decision
+vector $\mathbf{z}_0$ is built as follows.
+Headings are set to consecutive chord angles:
+$\theta_i^{(0)} = \operatorname{atan2}(\tilde{y}_{i+1} - \tilde{y}_i,\;
+                                       \tilde{x}_{i+1} - \tilde{x}_i)$
+(with $\theta_{N-1}^{(0)} = \theta_{N-2}^{(0)}$).
+Speeds are initialised uniformly at $0.6\,v_{\max}$, with $v_0^{(0)} =
+v_{\mathrm{init}}$.
+
+\subsection{Sequential Quadratic Programming (SLSQP)}
+
+The NLP~\eqref{eq:nlp} is solved by the Sequential Least-Squares Quadratic
+Programming (SLSQP) method as implemented in
+\texttt{scipy.optimize.minimize(method=`SLSQP')}.
+Solver settings:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Setting & Value \\
+\midrule
+Maximum iterations & $100$ \\
+Function tolerance & $10^{-6}$ \\
+Gradient           & finite differences (default) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+SLSQP builds a local quadratic model of the Lagrangian at each iteration and
+solves a quadratic program to obtain the search direction, then performs a
+line search that respects the nonlinear constraints.
+
+\subsection{Feasibility Check}
+
+After the solver returns, a hard post-hoc feasibility check is applied with
+tolerance $\delta = 10^{-3}$:
+
+\begin{enumerate}[label=(\alph*)]
+  \item $d_{N-1} \le r_G + \delta$ \quad (goal disk)
+  \item $v_{\min} - \delta \le v_i \le v_{\max} + \delta$ for all $i$
+  \item $d_i + \varepsilon + \delta \ge d_{i+1}$ for all $i$ \quad (progress)
+  \item $\kappa_i \le \kappa_{\max} + \delta$ for all $i$ \quad (curvature)
+  \item $a_{\mathrm{lat},i} \le a_{\mathrm{lat,max}} + \delta$ for all $i$
+  \item $|a_{\mathrm{long},i}| \le a_{\max} + \delta$ for all $i$
+  \item $\hat{C}_{\mathrm{fp}}(x_i, y_i, \theta_i) \le \tau + \delta$ for all $i$
+  \item Domain bounds with margin $m$ (as above)
+\end{enumerate}
+
+A plan that passes all checks is labelled \textbf{feasible}; otherwise it is
+\textbf{infeasible} (e.g., the solver converged to a local minimum violating a
+constraint, or the problem has no monotone-progress solution on the current
+landscape).
+
+\subsection{Candidate Ranking and Labelling}
+
+All $K$ solved plans are ranked by the composite key
+$(\neg\,\mathrm{feasible},\; J_{\mathrm{cost}})$ — feasible plans come first,
+and among plans of equal feasibility status they are ordered by ascending
+integrated footprint cost.
+Plans are then labelled \textbf{Plan A}, \textbf{Plan B}, \ldots in rank order.
+
+\subsection{Plan Metrics}
+
+For each plan the following scalar metrics are reported:
+
+\begin{align}
+  J_{\mathrm{integrated}} &= \sum_{i=0}^{N-2} \bar{C}_{\mathrm{fp}}(x_i, y_i, \theta_i)\,\Delta s_i, \\[4pt]
+  J_{\mathrm{peak}}       &= \max_{i=0,\ldots,N-1} \hat{C}_{\mathrm{fp}}(x_i, y_i, \theta_i), \\[4pt]
+  L_{\mathrm{total}}      &= \sum_{i=0}^{N-2} \Delta s_i, \\[4pt]
+  T_{\mathrm{total}}      &= \sum_{i=0}^{N-2} \frac{\Delta s_i}{\bar{v}_i}, \\[4pt]
+  d_{\mathrm{goal}}       &= \|(x_{N-1} - x_G,\; y_{N-1} - y_G)\|_2.
+\end{align}
+
+% ============================================================
+\section{Full Planning Loop}
+% ============================================================
+
+Algorithm~\ref{alg:main} gives the complete online planning loop executed by
+the orchestrator.
+
+\begin{algorithm}[H]
+\caption{Online constrained path-planning loop}
+\label{alg:main}
+\begin{algorithmic}[1]
+\Require $n_{\mathrm{events}}$, seeds $s_L$ (landscape), $s_E$ (emulator)
+\State Initialise landscape $C$ with seed $s_L$
+\State Initialise Poisson emulator with seed $s_E$
+\State Define planning problem: start $(10,10,\pi/4,5)$, goal $(90,90)$, $r_G=5$, $N=20$
+\State \Call{Plan}{``Event 00 --- Initial''} \Comment{Plan on unperturbed landscape}
+\For{each trigger event $e_k$, $k = 1, \ldots, n_{\mathrm{events}}$}
+  \State Advance landscape via OU step (Section~2.2)
+  \State \Call{Plan}{``Event $k$''}
+\EndFor
+\Statex
+\Procedure{Plan}{label}
+  \State Generate $K=3$ diverse seed paths (Algorithm~\ref{alg:seeds})
+  \State Resample each seed to $N$ waypoints
+  \For{each seed $k$}
+    \State Solve NLP~\eqref{eq:nlp} via SLSQP, initialised at $\mathbf{z}_0^{(k)}$
+    \State Post-hoc feasibility check
+    \State Compute plan metrics
+  \EndFor
+  \State Sort and label: Plan A, B, \ldots
+  \State Save PNG visualisation (cost heatmap + comparison table + speed profiles)
+  \State Return ranked candidate list
+\EndProcedure
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Infeasible events.}
+When the OU evolution places large obstacles across all monotone-progress
+corridors it is mathematically impossible to satisfy
+constraint~\eqref{eq:progress} while reaching the goal.
+In this case all $K$ plans are correctly labelled infeasible; this serves as an
+informative signal to the operator that no trajectory meeting all constraints
+currently exists, and the system may request a replanning after the next trigger
+event.
+
+% ============================================================
+\section{Parameters Summary}
+% ============================================================
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Symbol & Description & Value & Unit \\
+\midrule
+$N$                      & Waypoints per path          & $20$       & --- \\
+$K$                      & Candidate seeds             & $3$        & --- \\
+$\mathcal{D}$            & Domain                      & $[0,100]^2$& m \\
+$\mathbf{p}_s$           & Start position              & $(10,10)$  & m \\
+$\mathbf{p}_G$           & Goal position               & $(90,90)$  & m \\
+$r_G$                    & Goal radius                 & $5$        & m \\
+$\theta_{\mathrm{init}}$ & Initial heading             & $\pi/4$    & rad \\
+$v_{\mathrm{init}}$      & Initial speed               & $5$        & m/s \\
+$v_{\min}/v_{\max}$      & Speed bounds                & $0.5/15$   & m/s \\
+$a_{\max}$               & Long.\ accel.\ limit        & $3$        & m/s$^2$ \\
+$a_{\mathrm{lat,max}}$   & Lat.\ accel.\ limit         & $2$        & m/s$^2$ \\
+$\kappa_{\max}$          & Curvature limit             & $0.15$     & m$^{-1}$ \\
+$\tau$                   & Obstacle cost threshold     & $100$      & --- \\
+$c_{\mathrm{bg}}$        & Background cost             & $0.1$      & --- \\
+$N_{\mathrm{obs}}$       & Hard obstacles              & $4$        & --- \\
+$A_{\mathrm{obs}}$       & Obstacle amplitude          & $10^4$     & --- \\
+$\theta_A, \sigma_A$     & OU amplitude params         & $0.3,\,0.4$& --- \\
+$\theta_P, \sigma_P$     & OU position params          & $0.1,\,1.5$& m \\
+$\sigma_W$               & OU width volatility         & $0.3$      & m \\
+$\lambda_D, \lambda_B$   & Death/birth rates           & $0.15,\,0.3$& --- \\
+$\mu_T$                  & Mean trigger interval       & $8$        & s \\
+$w_H, w_S, w_V$          & Objective weights           & $10,\,2,\,0.5$ & --- \\
+$A_{\mathrm{pen}},\sigma_{\mathrm{pen}}$ & Diversity penalty & $5,\,8$ & m \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{document}
