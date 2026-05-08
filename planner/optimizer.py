@@ -1,5 +1,5 @@
 """
-optimizer.py — Constrained NLP path optimizer using scipy SLSQP.
+optimizer.py — Constrained NLP path optimizer using scipy trust-constr.
 
 Decision variables: z = [x_0, y_0, θ_0, v_0,  x_1, y_1, θ_1, v_1, ..., x_{N-1}, y_{N-1}, θ_{N-1}, v_{N-1}]
 Total: 4N variables.
@@ -8,7 +8,7 @@ Total: 4N variables.
 from __future__ import annotations
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, NonlinearConstraint
 from typing import Optional
 
 from .cost_landscape import CostLandscape, _OBB_TEMPLATE_UNIT
@@ -658,6 +658,23 @@ def _compute_plan_metrics(
     }
 
 
+def _to_nonlinear_constraints(cons: list[dict], n_vars: int) -> list:
+    """
+    Convert SLSQP-style constraint dicts to NonlinearConstraint objects with
+    explicit zero Hessians. This prevents trust-constr from falling back to
+    quasi-Newton Hessian approximations for each constraint's Lagrangian term,
+    which triggers delta_grad==0 warnings when exact Jacobians are supplied.
+    """
+    _zero_hess = lambda x, v: np.zeros((n_vars, n_vars))
+    result = []
+    for c in cons:
+        lb, ub = (0.0, 0.0) if c['type'] == 'eq' else (0.0, np.inf)
+        result.append(NonlinearConstraint(
+            c['fun'], lb, ub, jac=c['jac'], hess=_zero_hess,
+        ))
+    return result
+
+
 def generate_candidate_plans(
     landscape: CostLandscape,
     problem: PlanningProblem,
@@ -672,8 +689,8 @@ def generate_candidate_plans(
         landscape: Cost field
         problem: Planning problem specification
         seed_paths: List of (N, 2) resampled seed paths
-        maxiter: Max SLSQP iterations (default raised to 200; analytic gradients
-                 make each iteration much cheaper than in finite-difference mode)
+        maxiter: Max solver iterations (default 200; analytic gradients make each
+                 iteration much cheaper than finite-difference mode)
 
     Returns:
         Sorted list of candidate dicts.
@@ -682,7 +699,10 @@ def generate_candidate_plans(
     N = problem.n_waypoints
     epsilon = _compute_epsilon(problem)
 
-    constraints = _make_constraints(N, problem, landscape, epsilon)
+    n_vars = 4 * problem.n_waypoints
+    constraints = _to_nonlinear_constraints(
+        _make_constraints(N, problem, landscape, epsilon), n_vars
+    )
 
     candidates = []
 
@@ -693,13 +713,14 @@ def generate_candidate_plans(
             _objective_and_grad,
             z0,
             args=(N, landscape, vehicle),
-            method='SLSQP',
+            method='trust-constr',
             jac=True,          # _objective_and_grad returns (f, grad)
+            hess=lambda z, *_: np.zeros((len(z), len(z))),
             constraints=constraints,
             options={
                 'maxiter': maxiter,
-                'ftol': 1e-6,
-                'disp': False,
+                'gtol': 1e-6,
+                'verbose': 0,
             },
         )
 
