@@ -1,7 +1,7 @@
 """
-optimizer.py — Constrained NLP path optimizer using scipy trust-constr.
+optimizer.py - Constrained NLP path optimizer using scipy trust-constr.
 
-Decision variables: z = [x_0, y_0, θ_0, v_0,  x_1, y_1, θ_1, v_1, ..., x_{N-1}, y_{N-1}, θ_{N-1}, v_{N-1}]
+Decision variables: z = [x_0, y_0, theta_0, v_0,  x_1, y_1, theta_1, v_1, ..., x_{N-1}, y_{N-1}, theta_{N-1}, v_{N-1}]
 Total: 4N variables.
 """
 
@@ -27,7 +27,7 @@ def _unpack(z: np.ndarray, N: int):
 
 
 def _wrap_pi(angle: np.ndarray) -> np.ndarray:
-    """Wrap angle(s) to [-π, π]."""
+    """Wrap angle(s) to [-pi, pi]."""
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
 
@@ -39,8 +39,8 @@ def _field_gradient(
     """Analytic gradient of the cost field at query points.
 
     Returns (gx, gy) each shape (M,), where M = len(x_arr).
-    Derivation: C = Σ A·exp(-Q), dC/dx = -A·exp(-Q)·dQ/dx,
-    dQ/dx = (u/σx²)·cos(ϑ) - (v/σy²)·sin(ϑ).
+    Derivation: C = sum(A*exp(-Q)), dC/dx = -A*exp(-Q)*dQ/dx,
+    dQ/dx = (u/sigma_x^2)*cos(theta) - (v/sigma_y^2)*sin(theta).
     """
     gx = np.zeros_like(x_arr, dtype=np.float64)
     gy = np.zeros_like(y_arr, dtype=np.float64)
@@ -118,10 +118,10 @@ def _objective_and_grad(
     """Return (J, dJ/dz) analytically. Eliminates finite-difference overhead.
 
     All four objective terms are differentiated analytically:
-      J_cost    — arc-length-weighted integrated footprint cost
-      J_heading — heading-to-chord alignment penalty
-      J_smooth  — heading smoothness penalty
-      J_speed   — speed smoothness penalty
+      J_cost    - arc-length-weighted integrated footprint cost
+      J_heading - heading-to-chord alignment penalty
+      J_smooth  - heading smoothness penalty
+      J_speed   - speed smoothness penalty
     """
     x, y, theta, v = _unpack(z, N)
     hl, hw = vehicle.half_length, vehicle.half_width
@@ -146,12 +146,12 @@ def _objective_and_grad(
     gx_fp = gx_5N.reshape(N, 5)
     gy_fp = gy_5N.reshape(N, 5)
 
-    mean_c = costs.mean(axis=1)   # (N,)  — mean footprint cost per waypoint
-    d_mx = gx_fp.mean(axis=1)    # (N,)  — d(mean_c)/d(x_i)
-    d_my = gy_fp.mean(axis=1)    # (N,)  — d(mean_c)/d(y_i)
+    mean_c = costs.mean(axis=1)   # (N,) - mean footprint cost per waypoint
+    d_mx = gx_fp.mean(axis=1)    # (N,) - d(mean_c)/d(x_i)
+    d_my = gy_fp.mean(axis=1)    # (N,) - d(mean_c)/d(y_i)
 
     # d(mean_c)/d(theta_i): chain rule through OBB rotation
-    # dp_k/dθ = dR/dθ @ local_k,  dR/dθ = [[-sinθ, -cosθ], [cosθ, -sinθ]]
+    # dp_k/dtheta = dR/dtheta @ local_k,  dR/dtheta = [[-sin(theta), -cos(theta)], [cos(theta), -sin(theta)]]
     dp_x_dt = -sin_t[:, None] * lx[None, :] - cos_t[:, None] * ly[None, :]  # (N,5)
     dp_y_dt =  cos_t[:, None] * lx[None, :] - sin_t[:, None] * ly[None, :]
     d_mt = (gx_fp * dp_x_dt + gy_fp * dp_y_dt).mean(axis=1)  # (N,)
@@ -190,7 +190,7 @@ def _objective_and_grad(
     # d(ref_i)/d(x_{i+1}) = -dy_i/ds2_i
     # d(ref_i)/d(y_i)     = -dx_i/ds2_i
     # d(ref_i)/d(y_{i+1}) = +dx_i/ds2_i
-    # e_i = wrap_pi(θ_i - ref_i)  →  d(e_i)/d(z) = -d(ref_i)/d(z)
+    # e_i = wrap_pi(theta_i - ref_i)  ->  d(e_i)/d(z) = -d(ref_i)/d(z)
     ds2_seg = np.maximum(dx_seg ** 2 + dy_seg ** 2, 1e-16)
     coeff_H = 2.0 * W_HEADING * e_H   # (N-1,)
     grad_t[:N-1] += coeff_H
@@ -204,8 +204,8 @@ def _objective_and_grad(
     J_smooth = W_SMOOTH * float(np.sum(dtheta ** 2))
 
     coeff_S = 2.0 * W_SMOOTH * dtheta
-    grad_t[:N-1] -= coeff_S   # d(dθ_i)/d(θ_i) = -1
-    grad_t[1:]   += coeff_S   # d(dθ_i)/d(θ_{i+1}) = +1
+    grad_t[:N-1] -= coeff_S   # d(dtheta_i)/d(theta_i) = -1
+    grad_t[1:]   += coeff_S   # d(dtheta_i)/d(theta_{i+1}) = +1
 
     # --- J_speed ---
     dv = v[1:] - v[:-1]  # (N-1,)
@@ -231,7 +231,7 @@ def _make_constraints(
     landscape: CostLandscape,
     epsilon: float,
 ) -> list[dict]:
-    """Build scipy constraint dicts for SLSQP, each with analytic 'jac'."""
+    """Build constraint dicts, each with analytic 'jac' for conversion to NonlinearConstraint."""
     vehicle = problem.vehicle
     hl, hw = vehicle.half_length, vehicle.half_width
     cfg = landscape.config
@@ -294,7 +294,7 @@ def _make_constraints(
         d_safe = np.maximum(d, 1e-8)
         J = np.zeros((N - 1, 4 * N))
         ii = np.arange(N - 1)
-        # g_i = d_i + ε − d_{i+1}
+        # g_i = d_i + eps - d_{i+1}
         J[ii, 4 * ii]           =  (x[:-1] - problem.x_goal) / d_safe[:-1]
         J[ii, 4 * ii + 1]       =  (y[:-1] - problem.y_goal) / d_safe[:-1]
         J[ii, 4 * (ii + 1)]     = -(x[1:]  - problem.x_goal) / d_safe[1:]
@@ -353,7 +353,7 @@ def _make_constraints(
         da_dvi  = -v[:-1] / ds
         da_dvi1 =  v[1:]  / ds
 
-        # d(a_long)/d(x_i) = v_avg * dv * dx / ds³  (zero when clamped)
+        # d(a_long)/d(x_i) = v_avg * dv * dx / ds^3  (zero when clamped)
         ds3 = ds ** 3
         da_dxi  = np.where(clamped, 0.0,  v_avg * dv * dx / ds3)
         da_dxi1 = np.where(clamped, 0.0, -v_avg * dv * dx / ds3)
@@ -363,7 +363,7 @@ def _make_constraints(
         J = np.zeros((2 * (N - 1), 4 * N))
         ii = np.arange(N - 1)
 
-        # Rows 0..N-2: a_max − a_long ≥ 0  →  Jacobian = −d(a_long)/d(z)
+        # Rows 0..N-2: a_max - a_long >= 0  ->  Jacobian = -d(a_long)/d(z)
         J[ii, 4 * ii]           = -da_dxi
         J[ii, 4 * ii + 1]       = -da_dyi
         J[ii, 4 * ii + 3]       = -da_dvi
@@ -371,7 +371,7 @@ def _make_constraints(
         J[ii, 4 * (ii + 1) + 1] = -da_dyi1
         J[ii, 4 * (ii + 1) + 3] = -da_dvi1
 
-        # Rows N-1..2N-3: a_max + a_long ≥ 0  →  Jacobian = +d(a_long)/d(z)
+        # Rows N-1..2N-3: a_max + a_long >= 0  ->  Jacobian = +d(a_long)/d(z)
         J[N - 1 + ii, 4 * ii]           =  da_dxi
         J[N - 1 + ii, 4 * ii + 1]       =  da_dyi
         J[N - 1 + ii, 4 * ii + 3]       =  da_dvi
@@ -405,11 +405,11 @@ def _make_constraints(
         abs_dth = np.abs(dth)
         sign_dth = np.sign(dth)
 
-        # κ = |dθ| / ds
-        # d(κ)/d(θ_i)     = −sign(dθ) / ds
-        # d(κ)/d(θ_{i+1}) = +sign(dθ) / ds
-        # d(κ)/d(x_i)     = |dθ| · dx / ds³   (zero when clamped)
-        # d(g)/d(z) = −d(κ)/d(z)
+        # kappa = |dtheta| / ds
+        # d(kappa)/d(theta_i)     = -sign(dtheta) / ds
+        # d(kappa)/d(theta_{i+1}) = +sign(dtheta) / ds
+        # d(kappa)/d(x_i)         = |dtheta| * dx / ds^3   (zero when clamped)
+        # d(g)/d(z) = -d(kappa)/d(z)
         ds3 = ds ** 3
         J = np.zeros((N - 1, 4 * N))
         ii = np.arange(N - 1)
@@ -452,11 +452,11 @@ def _make_constraints(
         v_avg = 0.5 * (v[:-1] + v[1:])
         v_avg2 = v_avg ** 2
 
-        # a_lat = v_avg² · κ
-        # d(a_lat)/d(v_i) = v_avg · κ  (from d(v_avg²)/d(v_i) = v_avg)
-        # d(a_lat)/d(θ_i) = v_avg² · (−sign(dθ)/ds)
-        # d(a_lat)/d(x_i) = v_avg² · |dθ| · dx / ds³
-        # d(g)/d(z) = −d(a_lat)/d(z)
+        # a_lat = v_avg^2 * kappa
+        # d(a_lat)/d(v_i)     = v_avg * kappa  (from d(v_avg^2)/d(v_i) = v_avg)
+        # d(a_lat)/d(theta_i) = v_avg^2 * (-sign(dtheta)/ds)
+        # d(a_lat)/d(x_i)     = v_avg^2 * |dtheta| * dx / ds^3
+        # d(g)/d(z) = -d(a_lat)/d(z)
         ds3 = ds ** 3
         J = np.zeros((N - 1, 4 * N))
         ii = np.arange(N - 1)
@@ -475,7 +475,7 @@ def _make_constraints(
     constraints.append({'type': 'ineq', 'fun': ineq_lat_accel, 'jac': lat_jac})
 
     # ------------------------------------------------------------------ #
-    # Inequality: obstacle clearance  (hot path — block-diagonal Jacobian)
+    # Inequality: obstacle clearance  (hot path - block-diagonal Jacobian)
     # ------------------------------------------------------------------ #
     def ineq_obstacle(z):
         x, y, theta, _ = _unpack(z, N)
@@ -506,14 +506,14 @@ def _make_constraints(
         gx_max = gx_all[ii, k_star]               # (N,)
         gy_max = gy_all[ii, k_star]
 
-        # d(max_cost)/d(θ_i) via OBB rotation derivative at k_star
+        # d(max_cost)/d(theta_i) via OBB rotation derivative at k_star
         lx_k = lx_obb[k_star]
         ly_k = ly_obb[k_star]
         dp_x_dt = -sin_t * lx_k - cos_t * ly_k   # (N,)
         dp_y_dt =  cos_t * lx_k - sin_t * ly_k
         dmax_dtheta = gx_max * dp_x_dt + gy_max * dp_y_dt  # (N,)
 
-        # g_i = τ − max_cost_i  →  d(g_i)/d(z) = −d(max_cost_i)/d(z)
+        # g_i = tau - max_cost_i  ->  d(g_i)/d(z) = -d(max_cost_i)/d(z)
         J = np.zeros((N, 4 * N))
         J[ii, 4 * ii]     = -gx_max
         J[ii, 4 * ii + 1] = -gy_max
@@ -534,7 +534,7 @@ def _make_constraints(
             (cfg.y_max - margin) - y,
         ])
 
-    # Constant Jacobian: ±1 at x/y slots
+    # Constant Jacobian: +/-1 at x/y slots
     _J_dom = np.zeros((4 * N, 4 * N))
     _ii = np.arange(N)
     _J_dom[_ii,           4 * _ii]       =  1.0
