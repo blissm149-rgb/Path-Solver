@@ -91,9 +91,9 @@ def render_event(
 
     # --- Cost field heatmap ---
     X, Y, C = landscape.to_grid(resolution=200)
-    C_display = np.clip(C, 0, 15)
-    im = ax_map.pcolormesh(X, Y, C_display, cmap='inferno', shading='auto', vmin=0, vmax=15)
-    plt.colorbar(im, ax=ax_map, label='Cost (clipped to 15)', shrink=0.7)
+    C_display = np.log1p(np.clip(C, 0, None))
+    im = ax_map.pcolormesh(X, Y, C_display, cmap='inferno', shading='auto')
+    plt.colorbar(im, ax=ax_map, label='ln(1 + Cost)', shrink=0.7)
 
     # Obstacle contours
     ax_map.contour(X, Y, C, levels=[100.0], colors=['red'],
