@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.optimize import minimize, NonlinearConstraint
+from scipy.sparse import csr_matrix, diags
 from typing import Optional
 
 from .cost_landscape import CostLandscape, _OBB_TEMPLATE_UNIT
@@ -231,11 +232,13 @@ def _make_constraints(
     landscape: CostLandscape,
     epsilon: float,
 ) -> list[dict]:
-    """Build constraint dicts, each with analytic 'jac' for conversion to NonlinearConstraint."""
+    """Build nonlinear constraint dicts with analytic sparse Jacobians.
+
+    Box constraints (initial state, speed bounds, domain) are handled via the
+    bounds parameter in generate_candidate_plans and are NOT included here.
+    """
     vehicle = problem.vehicle
     hl, hw = vehicle.half_length, vehicle.half_width
-    cfg = landscape.config
-    margin = max(hl, hw)
 
     # Scaled OBB template used in obstacle Jacobian
     local_pts = _OBB_TEMPLATE_UNIT * np.array([hl, hw])  # (5, 2)
@@ -243,25 +246,6 @@ def _make_constraints(
     ly_obb = local_pts[:, 1]
 
     constraints = []
-
-    # ------------------------------------------------------------------ #
-    # Equality: initial state pinned
-    # ------------------------------------------------------------------ #
-    def eq_init(z):
-        x, y, theta, v = _unpack(z, N)
-        return np.array([
-            x[0] - problem.x_init,
-            y[0] - problem.y_init,
-            _wrap_pi(np.array([theta[0] - problem.theta_init]))[0],
-            v[0] - problem.v_init,
-        ])
-
-    # Constant Jacobian: identity in first 4 columns
-    _J_eq = np.zeros((4, 4 * N))
-    _J_eq[0, 0] = _J_eq[1, 1] = _J_eq[2, 2] = _J_eq[3, 3] = 1.0
-
-    constraints.append({'type': 'eq', 'fun': eq_init,
-                         'jac': lambda z, _J=_J_eq: _J})
 
     # ------------------------------------------------------------------ #
     # Inequality: terminal in goal disk
@@ -273,10 +257,10 @@ def _make_constraints(
 
     def goal_jac(z):
         x, y, _, _ = _unpack(z, N)
-        J = np.zeros((1, 4 * N))
-        J[0, 4 * (N - 1)]     = -2.0 * (x[-1] - problem.x_goal)
-        J[0, 4 * (N - 1) + 1] = -2.0 * (y[-1] - problem.y_goal)
-        return J
+        rows = [0, 0]
+        cols = [4 * (N - 1), 4 * (N - 1) + 1]
+        data = [-2.0 * (x[-1] - problem.x_goal), -2.0 * (y[-1] - problem.y_goal)]
+        return csr_matrix((data, (rows, cols)), shape=(1, 4 * N))
 
     constraints.append({'type': 'ineq', 'fun': ineq_goal, 'jac': goal_jac})
 
@@ -292,39 +276,20 @@ def _make_constraints(
         x, y, _, _ = _unpack(z, N)
         d = np.sqrt((x - problem.x_goal) ** 2 + (y - problem.y_goal) ** 2)
         d_safe = np.maximum(d, 1e-8)
-        J = np.zeros((N - 1, 4 * N))
         ii = np.arange(N - 1)
-        # g_i = d_i + eps - d_{i+1}
-        J[ii, 4 * ii]           =  (x[:-1] - problem.x_goal) / d_safe[:-1]
-        J[ii, 4 * ii + 1]       =  (y[:-1] - problem.y_goal) / d_safe[:-1]
-        J[ii, 4 * (ii + 1)]     = -(x[1:]  - problem.x_goal) / d_safe[1:]
-        J[ii, 4 * (ii + 1) + 1] = -(y[1:]  - problem.y_goal) / d_safe[1:]
-        return J
+        # g_i = d_i + eps - d_{i+1}: 4 nonzeros per row
+        rows = np.repeat(ii, 4)
+        cols = np.column_stack([4*ii, 4*ii+1, 4*(ii+1), 4*(ii+1)+1]).ravel()
+        data = np.column_stack([
+             (x[:-1] - problem.x_goal) / d_safe[:-1],
+             (y[:-1] - problem.y_goal) / d_safe[:-1],
+            -(x[1:]  - problem.x_goal) / d_safe[1:],
+            -(y[1:]  - problem.y_goal) / d_safe[1:],
+        ]).ravel()
+        return csr_matrix((data, (rows, cols)), shape=(N - 1, 4 * N))
 
     constraints.append({'type': 'ineq', 'fun': ineq_progress,
                          'jac': progress_jac})
-
-    # ------------------------------------------------------------------ #
-    # Inequality: speed bounds
-    # ------------------------------------------------------------------ #
-    def ineq_v_min(z):
-        _, _, _, v = _unpack(z, N)
-        return v - vehicle.v_min
-
-    def ineq_v_max(z):
-        _, _, _, v = _unpack(z, N)
-        return vehicle.v_max - v
-
-    # Constant Jacobians: diagonal in v slots (index 3, 7, 11, ...)
-    _J_vmin = np.zeros((N, 4 * N))
-    _J_vmax = np.zeros((N, 4 * N))
-    _J_vmin[np.arange(N), 4 * np.arange(N) + 3] =  1.0
-    _J_vmax[np.arange(N), 4 * np.arange(N) + 3] = -1.0
-
-    constraints.append({'type': 'ineq', 'fun': ineq_v_min,
-                         'jac': lambda z, _J=_J_vmin: _J})
-    constraints.append({'type': 'ineq', 'fun': ineq_v_max,
-                         'jac': lambda z, _J=_J_vmax: _J})
 
     # ------------------------------------------------------------------ #
     # Inequality: longitudinal acceleration bounds
@@ -360,26 +325,23 @@ def _make_constraints(
         da_dyi  = np.where(clamped, 0.0,  v_avg * dv * dy / ds3)
         da_dyi1 = np.where(clamped, 0.0, -v_avg * dv * dy / ds3)
 
-        J = np.zeros((2 * (N - 1), 4 * N))
-        ii = np.arange(N - 1)
+        m = N - 1
+        ii = np.arange(m)
 
         # Rows 0..N-2: a_max - a_long >= 0  ->  Jacobian = -d(a_long)/d(z)
-        J[ii, 4 * ii]           = -da_dxi
-        J[ii, 4 * ii + 1]       = -da_dyi
-        J[ii, 4 * ii + 3]       = -da_dvi
-        J[ii, 4 * (ii + 1)]     = -da_dxi1
-        J[ii, 4 * (ii + 1) + 1] = -da_dyi1
-        J[ii, 4 * (ii + 1) + 3] = -da_dvi1
+        r0 = np.repeat(ii, 6)
+        c0 = np.column_stack([4*ii, 4*ii+1, 4*ii+3, 4*(ii+1), 4*(ii+1)+1, 4*(ii+1)+3]).ravel()
+        d0 = np.column_stack([-da_dxi, -da_dyi, -da_dvi, -da_dxi1, -da_dyi1, -da_dvi1]).ravel()
 
         # Rows N-1..2N-3: a_max + a_long >= 0  ->  Jacobian = +d(a_long)/d(z)
-        J[N - 1 + ii, 4 * ii]           =  da_dxi
-        J[N - 1 + ii, 4 * ii + 1]       =  da_dyi
-        J[N - 1 + ii, 4 * ii + 3]       =  da_dvi
-        J[N - 1 + ii, 4 * (ii + 1)]     =  da_dxi1
-        J[N - 1 + ii, 4 * (ii + 1) + 1] =  da_dyi1
-        J[N - 1 + ii, 4 * (ii + 1) + 3] =  da_dvi1
+        r1 = np.repeat(m + ii, 6)
+        c1 = c0  # same column pattern
+        d1 = np.column_stack([da_dxi, da_dyi, da_dvi, da_dxi1, da_dyi1, da_dvi1]).ravel()
 
-        return J
+        rows = np.concatenate([r0, r1])
+        cols = np.concatenate([c0, c1])
+        data = np.concatenate([d0, d1])
+        return csr_matrix((data, (rows, cols)), shape=(2 * m, 4 * N))
 
     constraints.append({'type': 'ineq', 'fun': ineq_accel, 'jac': accel_jac})
 
@@ -411,17 +373,21 @@ def _make_constraints(
         # d(kappa)/d(x_i)         = |dtheta| * dx / ds^3   (zero when clamped)
         # d(g)/d(z) = -d(kappa)/d(z)
         ds3 = ds ** 3
-        J = np.zeros((N - 1, 4 * N))
         ii = np.arange(N - 1)
 
-        J[ii, 4 * ii]           = np.where(clamped, 0.0, -abs_dth * dx / ds3)
-        J[ii, 4 * ii + 1]       = np.where(clamped, 0.0, -abs_dth * dy / ds3)
-        J[ii, 4 * ii + 2]       =  sign_dth / ds
-        J[ii, 4 * (ii + 1)]     = np.where(clamped, 0.0,  abs_dth * dx / ds3)
-        J[ii, 4 * (ii + 1) + 1] = np.where(clamped, 0.0,  abs_dth * dy / ds3)
-        J[ii, 4 * (ii + 1) + 2] = -sign_dth / ds
-
-        return J
+        rows = np.repeat(ii, 6)
+        cols = np.column_stack([
+            4*ii, 4*ii+1, 4*ii+2, 4*(ii+1), 4*(ii+1)+1, 4*(ii+1)+2
+        ]).ravel()
+        data = np.column_stack([
+            np.where(clamped, 0.0, -abs_dth * dx / ds3),
+            np.where(clamped, 0.0, -abs_dth * dy / ds3),
+             sign_dth / ds,
+            np.where(clamped, 0.0,  abs_dth * dx / ds3),
+            np.where(clamped, 0.0,  abs_dth * dy / ds3),
+            -sign_dth / ds,
+        ]).ravel()
+        return csr_matrix((data, (rows, cols)), shape=(N - 1, 4 * N))
 
     constraints.append({'type': 'ineq', 'fun': ineq_curvature, 'jac': curv_jac})
 
@@ -458,19 +424,24 @@ def _make_constraints(
         # d(a_lat)/d(x_i)     = v_avg^2 * |dtheta| * dx / ds^3
         # d(g)/d(z) = -d(a_lat)/d(z)
         ds3 = ds ** 3
-        J = np.zeros((N - 1, 4 * N))
         ii = np.arange(N - 1)
 
-        J[ii, 4 * ii]           = np.where(clamped, 0.0, -v_avg2 * abs_dth * dx / ds3)
-        J[ii, 4 * ii + 1]       = np.where(clamped, 0.0, -v_avg2 * abs_dth * dy / ds3)
-        J[ii, 4 * ii + 2]       =  v_avg2 * sign_dth / ds
-        J[ii, 4 * ii + 3]       = -v_avg * kappa
-        J[ii, 4 * (ii + 1)]     = np.where(clamped, 0.0,  v_avg2 * abs_dth * dx / ds3)
-        J[ii, 4 * (ii + 1) + 1] = np.where(clamped, 0.0,  v_avg2 * abs_dth * dy / ds3)
-        J[ii, 4 * (ii + 1) + 2] = -v_avg2 * sign_dth / ds
-        J[ii, 4 * (ii + 1) + 3] = -v_avg * kappa
-
-        return J
+        rows = np.repeat(ii, 8)
+        cols = np.column_stack([
+            4*ii, 4*ii+1, 4*ii+2, 4*ii+3,
+            4*(ii+1), 4*(ii+1)+1, 4*(ii+1)+2, 4*(ii+1)+3,
+        ]).ravel()
+        data = np.column_stack([
+            np.where(clamped, 0.0, -v_avg2 * abs_dth * dx / ds3),
+            np.where(clamped, 0.0, -v_avg2 * abs_dth * dy / ds3),
+             v_avg2 * sign_dth / ds,
+            -v_avg * kappa,
+            np.where(clamped, 0.0,  v_avg2 * abs_dth * dx / ds3),
+            np.where(clamped, 0.0,  v_avg2 * abs_dth * dy / ds3),
+            -v_avg2 * sign_dth / ds,
+            -v_avg * kappa,
+        ]).ravel()
+        return csr_matrix((data, (rows, cols)), shape=(N - 1, 4 * N))
 
     constraints.append({'type': 'ineq', 'fun': ineq_lat_accel, 'jac': lat_jac})
 
@@ -479,11 +450,15 @@ def _make_constraints(
     # ------------------------------------------------------------------ #
     def ineq_obstacle(z):
         x, y, theta, _ = _unpack(z, N)
-        vals = []
-        for i in range(N):
-            _, max_c = landscape.evaluate_footprint(x[i], y[i], theta[i], hl, hw)
-            vals.append(problem.obstacle_cost_threshold - max_c)
-        return np.array(vals)
+        cos_t = np.cos(theta)   # (N,)
+        sin_t = np.sin(theta)
+
+        # World coords of all 5N footprint points (vectorized, consistent with Jacobian)
+        px = cos_t[:, None] * lx_obb[None, :] - sin_t[:, None] * ly_obb[None, :] + x[:, None]
+        py = sin_t[:, None] * lx_obb[None, :] + cos_t[:, None] * ly_obb[None, :] + y[:, None]
+
+        costs = landscape.evaluate(px.ravel(), py.ravel()).reshape(N, 5)
+        return problem.obstacle_cost_threshold - costs.max(axis=1)
 
     def obstacle_jac(z):
         x, y, theta, _ = _unpack(z, N)
@@ -514,36 +489,13 @@ def _make_constraints(
         dmax_dtheta = gx_max * dp_x_dt + gy_max * dp_y_dt  # (N,)
 
         # g_i = tau - max_cost_i  ->  d(g_i)/d(z) = -d(max_cost_i)/d(z)
-        J = np.zeros((N, 4 * N))
-        J[ii, 4 * ii]     = -gx_max
-        J[ii, 4 * ii + 1] = -gy_max
-        J[ii, 4 * ii + 2] = -dmax_dtheta
-        return J
+        ii = np.arange(N)
+        rows = np.repeat(ii, 3)
+        cols = np.column_stack([4*ii, 4*ii+1, 4*ii+2]).ravel()
+        data = np.column_stack([-gx_max, -gy_max, -dmax_dtheta]).ravel()
+        return csr_matrix((data, (rows, cols)), shape=(N, 4 * N))
 
     constraints.append({'type': 'ineq', 'fun': ineq_obstacle, 'jac': obstacle_jac})
-
-    # ------------------------------------------------------------------ #
-    # Inequality: domain bounds (OBB must fit)
-    # ------------------------------------------------------------------ #
-    def ineq_domain(z):
-        x, y, _, _ = _unpack(z, N)
-        return np.concatenate([
-            x - (cfg.x_min + margin),
-            (cfg.x_max - margin) - x,
-            y - (cfg.y_min + margin),
-            (cfg.y_max - margin) - y,
-        ])
-
-    # Constant Jacobian: +/-1 at x/y slots
-    _J_dom = np.zeros((4 * N, 4 * N))
-    _ii = np.arange(N)
-    _J_dom[_ii,           4 * _ii]       =  1.0
-    _J_dom[N + _ii,       4 * _ii]       = -1.0
-    _J_dom[2 * N + _ii,   4 * _ii + 1]   =  1.0
-    _J_dom[3 * N + _ii,   4 * _ii + 1]   = -1.0
-
-    constraints.append({'type': 'ineq', 'fun': ineq_domain,
-                         'jac': lambda z, _J=_J_dom: _J})
 
     return constraints
 
@@ -665,7 +617,7 @@ def _to_nonlinear_constraints(cons: list[dict], n_vars: int) -> list:
     quasi-Newton Hessian approximations for each constraint's Lagrangian term,
     which triggers delta_grad==0 warnings when exact Jacobians are supplied.
     """
-    _zero_hess = lambda x, v: np.zeros((n_vars, n_vars))
+    _zero_hess = lambda x, v: csr_matrix((n_vars, n_vars))
     result = []
     for c in cons:
         lb, ub = (0.0, 0.0) if c['type'] == 'eq' else (0.0, np.inf)
@@ -679,7 +631,7 @@ def generate_candidate_plans(
     landscape: CostLandscape,
     problem: PlanningProblem,
     seed_paths: list[np.ndarray],
-    maxiter: int = 200,
+    maxiter: int = 100,
 ) -> list[dict]:
     """
     Optimize each seed path, rank by (feasibility desc, integrated_cost asc),
@@ -689,8 +641,7 @@ def generate_candidate_plans(
         landscape: Cost field
         problem: Planning problem specification
         seed_paths: List of (N, 2) resampled seed paths
-        maxiter: Max solver iterations (default 200; analytic gradients make each
-                 iteration much cheaper than finite-difference mode)
+        maxiter: Max solver iterations per seed
 
     Returns:
         Sorted list of candidate dicts.
@@ -698,8 +649,41 @@ def generate_candidate_plans(
     vehicle = problem.vehicle
     N = problem.n_waypoints
     epsilon = _compute_epsilon(problem)
+    cfg = landscape.config
+    margin = max(vehicle.half_length, vehicle.half_width)
 
-    n_vars = 4 * problem.n_waypoints
+    # Box constraints as bounds: initial state pinned, speed and domain bounded.
+    # This removes 124/240 constraint rows from the KKT system.
+    bounds = []
+    for i in range(N):
+        if i == 0:
+            bounds += [
+                (problem.x_init,     problem.x_init),
+                (problem.y_init,     problem.y_init),
+                (problem.theta_init, problem.theta_init),
+                (problem.v_init,     problem.v_init),
+            ]
+        else:
+            bounds += [
+                (cfg.x_min + margin, cfg.x_max - margin),
+                (cfg.y_min + margin, cfg.y_max - margin),
+                (None, None),
+                (vehicle.v_min,      vehicle.v_max),
+            ]
+
+    # Diagonal objective Hessian from the quadratic smoothness and speed terms.
+    # Provides curvature for theta and v variables, enabling superlinear convergence.
+    def _obj_hess(z, *_):
+        d = np.zeros(4 * N)
+        d[2::4] = 4.0 * W_SMOOTH    # interior theta nodes
+        d[2]          = 2.0 * W_SMOOTH  # first endpoint
+        d[4*(N-1)+2]  = 2.0 * W_SMOOTH  # last endpoint
+        d[3::4] = 4.0 * W_SPEED     # interior v nodes
+        d[3]          = 2.0 * W_SPEED
+        d[4*(N-1)+3]  = 2.0 * W_SPEED
+        return diags(d)
+
+    n_vars = 4 * N
     constraints = _to_nonlinear_constraints(
         _make_constraints(N, problem, landscape, epsilon), n_vars
     )
@@ -715,11 +699,12 @@ def generate_candidate_plans(
             args=(N, landscape, vehicle),
             method='trust-constr',
             jac=True,          # _objective_and_grad returns (f, grad)
-            hess=lambda z, *_: np.zeros((len(z), len(z))),
+            hess=_obj_hess,
+            bounds=bounds,
             constraints=constraints,
             options={
                 'maxiter': maxiter,
-                'gtol': 1e-6,
+                'gtol': 1e-5,
                 'verbose': 0,
             },
         )
